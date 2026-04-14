@@ -6,10 +6,10 @@
 // 1.1) Declaración de las variables del puente H 
 constexpr int PIN_IN1 = 27;
 constexpr int PIN_IN2 = 26;
-constexpr int PIN_IN3 = 25;
+constexpr int PIN_IN3 = 25; 
 constexpr int PIN_IN4 = 33;
 constexpr int PIN_ENA = 14;
-constexpr int PIN_ENB = 12;
+constexpr int PIN_ENB = 16;
 // 1.2) Declaración de las variables del sensor ultrasónico y servo (Radar)
 constexpr int PIN_TRIG = 4;
 constexpr int PIN_ECHO = 2;
@@ -22,130 +22,122 @@ constexpr int ANGULO_IZQ = 150;
 constexpr int ANGULO_CEN = 90;
 constexpr int ANGULO_DER = 30;
 // 2.3) Distancias que indican el pwm estimado para cada zona de navegación, estos valores son aproximados y deben ser ajustados con pruebas reales en terreno para que el rover tenga una respuesta adecuada a cada situación. La idea es que el rover tenga una zona de crucero donde va al 100%, una zona de precaución donde empieza a reducir velocidad, y zonas de decisión donde toma maniobras evasivas o se detiene por completo.
-constexpr float ZONA_CRUCERO:CM = 60.0; //Aquí la idea es que la velocidad vaya al 100% en esta zona, es decir, con un pwm de 255.
+constexpr float ZONA_CRUCERO_CM = 60.0; //Aquí la idea es que la velocidad vaya al 100% en esta zona, es decir, con un pwm de 255.
 constexpr float DISTANCIA_PRECOLISION_CM = 40.0; // Aquí la idea es que el rover empiece a reducir velocidad para evitar colisión, por ejemplo, con un pwm de 150.
 constexpr float DISTANCIA_DECISION_UMBRALALTO_CM = 30.0; // Aquí la idea es que el rover tome la decisión de maniobra evasiva, con un pwm de 100 o menos para maniobrar con mayor control.
 constexpr float DISTANCIA_DECISION_UMBRALBAJO_CM = 12.0; // Aquí la idea es que el rover tome la decisión de maniobra evasiva más agresiva, con un pwm de 50 o menos para maniobrar con mayor control.
 constexpr float DISTANCIA_STARTFAILSAFE_CM = 8.0; // Aquí la idea es que el rover se detenga por completo para evitar colisión, con un pwm de 0.
-// 2.4) Variables de estado NOTA: Aquí se pueden agregar más variables de estado para mejorar la lógica de navegación, la idea por ahora son solo 3: autonomo, manual y fail-safe (detenido por seguridad)
-bool modoAutomatico = false;
+// 2.4) Variables de estado NOTA: Aquí se pueden agregar más variables de estado para mejorar la lógica de navegación, la idea por ahora son solo 4: autonomo, manual, modo recarga y fail-safe (detenido por seguridad)
+enum EstadoSistema {
+  MANUAL,
+  AUTONOMO,
+  FAILSAFE,
+  RECARGA_SOLAR
+};
 // 2.5) Configuración de PWM en ESP32 (LEDC)
 constexpr int PWM_FREQ = 15000;     // Frecuencia de PWM (15 kHz) Esto sirve para evitar zumbidos audibles en los motores, pero se puede ajustar según el tipo de motor y la respuesta deseada. En general, frecuencias entre 10 kHz y 20 kHz suelen ser buenas para motores DC.
 constexpr int PWM_RESOLUTION = 8;   // Resolución 8 bits => 0..255 esto nos indica que el valor máximo de PWM es 255, lo cual es común para control de velocidad en motores DC. Si se quisiera más precisión, se podría usar 10 bits (0..1023), pero 8 bits suele ser suficiente para este tipo de aplicación.
 constexpr int PWM_CH_ENA = 0; // 
 constexpr int PWM_CH_ENB = 1;
 // -----------------------------------------------------------------------------
-// 4) CONTROL DE MOTORES CON PUENTE H
+// 4) CONTROL DE MOTORES CON PUENTE H 
+// 4.1) Voids para controlar los motores, cada función se encarga de una maniobra específica (avanzar, retroceder, detener) y utiliza la función setVelocidadMotores para ajustar la velocidad según la situación. La función detenerMotores se asegura de poner todas las entradas del puente H en LOW para detener el rover de manera segura.
 /*
   setVelocidadMotores:
   Escribe PWM a los canales ENA y ENB del puente H.
   - izq y der se limitan automáticamente entre 0 y 255.
 */
-    91   void setVelocidadMotores(int izq, int der) {
-    92	  izq = constrain(izq, 0, 255);
-    93	  der = constrain(der, 0, 255);
-    94	
-    95	  ledcWrite(PWM_CH_ENA, izq);
-    96	  ledcWrite(PWM_CH_ENB, der);
-    97	}
-    98	
-    99	/*
-   100	  detenerMotores:
-   101	  Pone todas las entradas del puente H en LOW para detener el rover.
-   102	*/
-   103	void detenerMotores() {
-   104	  digitalWrite(PIN_IN1, LOW);
-   105	  digitalWrite(PIN_IN2, LOW);
-   106	  digitalWrite(PIN_IN3, LOW);
-   107	  digitalWrite(PIN_IN4, LOW);
-   108	  setVelocidadMotores(0, 0);
-   109	}
-   110	
-   111	/*
-   112	  avanzar:
-   113	  Ambos lados hacia adelante.
-   114	*/
-   115	void avanzar(int pwm = 180) {
-   116	  digitalWrite(PIN_IN1, HIGH);
-   117	  digitalWrite(PIN_IN2, LOW);
-   118	  digitalWrite(PIN_IN3, HIGH);
-   119	  digitalWrite(PIN_IN4, LOW);
-   120	  setVelocidadMotores(pwm, pwm);
-   121	}
-   122	
-   123	/*
-   124	  retroceder:
-   125	  Ambos lados hacia atrás.
-   126	*/
-   127	void retroceder(int pwm = 180) {
-   128	  digitalWrite(PIN_IN1, LOW);
-   129	  digitalWrite(PIN_IN2, HIGH);
-   130	  digitalWrite(PIN_IN3, LOW);
-   131	  digitalWrite(PIN_IN4, HIGH);
-   132	  setVelocidadMotores(pwm, pwm);
-   133	}
-   134	
-   135	/*
-   136	  girarIzquierda:
-   137	  Detiene/reduce lado izquierdo y mueve lado derecho para girar.
-   138	  Aquí usamos giro en sitio aproximado (un lado adelante y otro atrás)
-   139	  para maniobra más cerrada.
-   140	*/
-   141	void girarIzquierda(int pwm = 170) {
-   142	  digitalWrite(PIN_IN1, LOW);
-   143	  digitalWrite(PIN_IN2, HIGH);
-   144	  digitalWrite(PIN_IN3, HIGH);
-   145	  digitalWrite(PIN_IN4, LOW);
-   146	  setVelocidadMotores(pwm, pwm);
-   147	}
-   148	
-   149	/*
-   150	  girarDerecha:
-   151	  Giro en sentido opuesto a girarIzquierda.
-   152	*/
-   153	void girarDerecha(int pwm = 170) {
-   154	  digitalWrite(PIN_IN1, HIGH);
-   155	  digitalWrite(PIN_IN2, LOW);
-   156	  digitalWrite(PIN_IN3, LOW);
-   157	  digitalWrite(PIN_IN4, HIGH);
-   158	  setVelocidadMotores(pwm, pwm);
-   159	}
-   160	
-   161	// -----------------------------------------------------------------------------
-   162	// 5) FUNCIONES DEL SENSOR ULTRASÓNICO
-   163	// -----------------------------------------------------------------------------
-   164	
-   165	/*
-   166	  medirDistanciaCM:
-   167	  1) Enviamos pulso corto por TRIG.
-   168	  2) Medimos ancho del pulso en ECHO con pulseIn.
-   169	  3) Convertimos tiempo a distancia.
-   170	
-   171	  Fórmula aproximada:
-   172	  distancia_cm = tiempo_us * 0.0343 / 2
-   173	  (porque el sonido va y regresa)
-   174	*/
-   175	float medirDistanciaCM() {
-   176	  // Aseguramos TRIG en LOW brevemente
-   177	  digitalWrite(PIN_TRIG, LOW);
-   178	  delayMicroseconds(3);
-   179	
-   180	  // Pulso de 10us para disparar medición
-   181	  digitalWrite(PIN_TRIG, HIGH);
-   182	  delayMicroseconds(10);
-   183	  digitalWrite(PIN_TRIG, LOW);
-   184	
-   185	  // Timeout de 25ms (≈4m), evita bloqueos largos si no hay eco
-   186	  unsigned long duracion = pulseIn(PIN_ECHO, HIGH, 25000UL);
-   187	
-   188	  // Si no hubo eco (duración 0), retornamos valor grande
-   189	  if (duracion == 0) {
-   190	    return 999.0;
-   191	  }
-   192	
-   193	  return (duracion * 0.0343f) / 2.0f;
-   194	}
-   195	
+void setVelocidadMotores(int izq, int der) { // Aquí se ponen los parametros de velocidad para cada lado; OJO, Aquí puede que los DC tengan potencias diferentes por ser baratos, por lo que se podrían ajustar con factores de corrección para que el rover vaya recto cuando ambos lados tienen el mismo valor de PWM.
+  izq = constrain(izq, 0, 255);
+  der = constrain(der, 0, 255);	
+  ledcWrite(PWM_CH_ENA, izq); // Aquí se escribe el valor de PWM para el lado izquierdo (ENA)
+  ledcWrite(PWM_CH_ENB, der); // Aquí se escribe el valor de PWM para el lado derecho (ENB)
+  }
+/*
+detenerMotores:
+Pone todas las entradas del puente H en LOW para detener el rover.
+*/
+void detenerMotores() {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(0, 0);
+  }
+/*
+avanzar:
+Ambos lados hacia adelante.
+*/
+void avanzar(int pwm = 180) {
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(pwm, pwm);
+  }
+/*
+retroceder:
+Ambos lados hacia atrás.
+*/
+void retroceder(int pwm = 180) {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, HIGH);
+  setVelocidadMotores(pwm, pwm);
+  }
+// 4.2) Funciones para girar, aquí se implementa un giro en sitio aproximado (un lado adelante y otro atrás) para maniobra más cerrada.
+/*
+girarIzquierda:
+Detiene/reduce lado izquierdo y mueve lado derecho para girar.
+Aquí usamos giro en sitio aproximado (un lado adelante y otro atrás)
+para maniobra más cerrada.
+*/
+void girarIzquierda(int pwm = 170) {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(pwm, pwm);
+  }
+/*
+girarDerecha:
+Giro en sentido opuesto a girarIzquierda.
+*/
+void girarDerecha(int pwm = 170) {
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, HIGH);
+  setVelocidadMotores(pwm, pwm);
+  }
+// -----------------------------------------------------------------------------
+// 5) TELEMETRÍA DE DISTANCIA CON ULTRASÓNICO Y SERVO (RADAR)
+/*
+medirDistanciaCM:
+1) Enviamos pulso corto por TRIG.
+2) Medimos ancho del pulso en ECHO con pulseIn.
+3) Convertimos tiempo a distancia.
+Fórmula aproximada:
+distancia_cm = tiempo_us * 0.0343 / 2 OJO: Aquí hay que hacer un re-Calculo preciso del valor, debido a que la velocidad del sonido puede variar con la temperatura y la humedad
+(porque el sonido va y regresa)
+*/
+float medirDistanciaCM() {
+// Aseguramos TRIG en LOW brevemente
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(3);
+// Pulso de 10us para disparar medición
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+// Timeout de 25ms (≈4m), evita bloqueos largos si no hay eco
+unsigned long duracion = pulseIn(PIN_ECHO, HIGH, 25000UL);
+// Si no hubo eco (duración 0), retornamos valor grande
+  if (duracion == 0) {
+    return 999.0;
+     }
+	  return (duracion * 0.0343f) / 2.0f;
+	}	
    196	/*
    197	  medirEnAngulo:
    198	  - Mueve servo al ángulo solicitado.
