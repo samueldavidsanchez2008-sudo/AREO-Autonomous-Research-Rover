@@ -1,0 +1,361 @@
+#include <Arduino.h> // Esta libreria sirve para la mayoría de las funciones básicas de Arduino/ESP32
+#include <BluetoothSerial.h> // Bluetooth clásico (SPP) en ESP32, me permite comunicación con celular
+#include <ESP32Servo.h>      // Librería para controlar servos en ESP32
+// -----------------------------------------------------------------------------
+// 1) DECLARACIÓN DE PINES Y CONSTANTES
+// 1.1) Declaración de las variables del puente H 
+constexpr int PIN_IN1 = 27;
+constexpr int PIN_IN2 = 26;
+constexpr int PIN_IN3 = 25; 
+constexpr int PIN_IN4 = 33;
+constexpr int PIN_ENA = 14;
+constexpr int PIN_ENB = 16;
+// 1.2) Declaración de las variables del sensor ultrasónico y servo (Radar)
+constexpr int PIN_TRIG = 4;
+constexpr int PIN_ECHO = 2;
+constexpr int PIN_SERVO = 13;
+// 2) Parametros de configuración
+// 2.1) Velocidad base (0..255 en PWM de 8 bits) OJO Aqui viene trabajo colaborativo para ajustar este valor en base al encoder y pruebas de terreno, para que el rover tenga buena respuesta sin ser demasiado rápido para maniobrar (automatización) ni demasiado lento para control manual.
+int velocidadBase = 180; // Solo para hacerse una idea
+// 2.2)Ángulos del radar ultrasónico (servo)
+constexpr int ANGULO_IZQ = 150;
+constexpr int ANGULO_CEN = 90;
+constexpr int ANGULO_DER = 30;
+// 2.3) Distancias que indican el pwm estimado para cada zona de navegación, estos valores son aproximados y deben ser ajustados con pruebas reales en terreno para que el rover tenga una respuesta adecuada a cada situación. La idea es que el rover tenga una zona de crucero donde va al 100%, una zona de precaución donde empieza a reducir velocidad, y zonas de decisión donde toma maniobras evasivas o se detiene por completo.
+constexpr float ZONA_CRUCERO_CM = 60.0; //Aquí la idea es que la velocidad vaya al 100% en esta zona, es decir, con un pwm de 255.
+constexpr float DISTANCIA_PRECOLISION_CM = 40.0; // Aquí la idea es que el rover empiece a reducir velocidad para evitar colisión, por ejemplo, con un pwm de 150.
+constexpr float DISTANCIA_DECISION_UMBRALALTO_CM = 30.0; // Aquí la idea es que el rover tome la decisión de maniobra evasiva, con un pwm de 100 o menos para maniobrar con mayor control.
+constexpr float DISTANCIA_DECISION_UMBRALBAJO_CM = 12.0; // Aquí la idea es que el rover tome la decisión de maniobra evasiva más agresiva, con un pwm de 50 o menos para maniobrar con mayor control.
+constexpr float DISTANCIA_STARTFAILSAFE_CM = 8.0; // Aquí la idea es que el rover se detenga por completo para evitar colisión, con un pwm de 0.
+// 2.4) Variables de estado NOTA: Aquí se pueden agregar más variables de estado para mejorar la lógica de navegación, la idea por ahora son solo 4: autonomo, manual, modo recarga y fail-safe (detenido por seguridad)
+enum EstadoSistema {
+  MANUAL,
+  AUTONOMO,
+  FAILSAFE,
+  RECARGA_SOLAR
+};
+// 2.5) Configuración de PWM en ESP32 (LEDC)
+constexpr int PWM_FREQ = 15000;     // Frecuencia de PWM (15 kHz) Esto sirve para evitar zumbidos audibles en los motores, pero se puede ajustar según el tipo de motor y la respuesta deseada. En general, frecuencias entre 10 kHz y 20 kHz suelen ser buenas para motores DC.
+constexpr int PWM_RESOLUTION = 8;   // Resolución 8 bits => 0..255 esto nos indica que el valor máximo de PWM es 255, lo cual es común para control de velocidad en motores DC. Si se quisiera más precisión, se podría usar 10 bits (0..1023), pero 8 bits suele ser suficiente para este tipo de aplicación.
+constexpr int PWM_CH_ENA = 0; // 
+constexpr int PWM_CH_ENB = 1;
+// -----------------------------------------------------------------------------
+// 4) CONTROL DE MOTORES CON PUENTE H 
+// 4.1) Voids para controlar los motores, cada función se encarga de una maniobra específica (avanzar, retroceder, detener) y utiliza la función setVelocidadMotores para ajustar la velocidad según la situación. La función detenerMotores se asegura de poner todas las entradas del puente H en LOW para detener el rover de manera segura.
+/*
+  setVelocidadMotores:
+  Escribe PWM a los canales ENA y ENB del puente H.
+  - izq y der se limitan automáticamente entre 0 y 255.
+*/
+void setVelocidadMotores(int izq, int der) { // Aquí se ponen los parametros de velocidad para cada lado; OJO, Aquí puede que los DC tengan potencias diferentes por ser baratos, por lo que se podrían ajustar con factores de corrección para que el rover vaya recto cuando ambos lados tienen el mismo valor de PWM.
+  izq = constrain(izq, 0, 255);
+  der = constrain(der, 0, 255);	
+  ledcWrite(PWM_CH_ENA, izq); // Aquí se escribe el valor de PWM para el lado izquierdo (ENA)
+  ledcWrite(PWM_CH_ENB, der); // Aquí se escribe el valor de PWM para el lado derecho (ENB)
+  }
+/*
+detenerMotores:
+Pone todas las entradas del puente H en LOW para detener el rover.
+*/
+void detenerMotores() {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(0, 0);
+  }
+/*
+avanzar:
+Ambos lados hacia adelante.
+*/
+void avanzar(int pwm = 180) {
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(pwm, pwm);
+  }
+/*
+retroceder:
+Ambos lados hacia atrás.
+*/
+void retroceder(int pwm = 180) {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, HIGH);
+  setVelocidadMotores(pwm, pwm);
+  }
+// 4.2) Funciones para girar, aquí se implementa un giro en sitio aproximado (un lado adelante y otro atrás) para maniobra más cerrada.
+/*
+girarIzquierda:
+Detiene/reduce lado izquierdo y mueve lado derecho para girar.
+Aquí usamos giro en sitio aproximado (un lado adelante y otro atrás)
+para maniobra más cerrada.
+*/
+void girarIzquierda(int pwm = 170) {
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, HIGH);
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+  setVelocidadMotores(pwm, pwm);
+  }
+/*
+girarDerecha:
+Giro en sentido opuesto a girarIzquierda.
+*/
+void girarDerecha(int pwm = 170) {
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, HIGH);
+  setVelocidadMotores(pwm, pwm);
+  }
+// -----------------------------------------------------------------------------
+// 5) TELEMETRÍA DE DISTANCIA CON ULTRASÓNICO Y SERVO (RADAR)
+/*
+medirDistanciaCM:
+1) Enviamos pulso corto por TRIG.
+2) Medimos ancho del pulso en ECHO con pulseIn.
+3) Convertimos tiempo a distancia.
+Fórmula aproximada:
+distancia_cm = tiempo_us * 0.0343 / 2 OJO: Aquí hay que hacer un re-Calculo preciso del valor, debido a que la velocidad del sonido puede variar con la temperatura y la humedad
+(porque el sonido va y regresa)
+*/
+float medirDistanciaCM() {
+// Aseguramos TRIG en LOW brevemente
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(3);
+// Pulso de 10us para disparar medición
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+// Timeout de 25ms (≈4m), evita bloqueos largos si no hay eco
+unsigned long duracion = pulseIn(PIN_ECHO, HIGH, 25000UL);
+// Si no hubo eco (duración 0), retornamos valor grande
+  if (duracion == 0) {
+    return 999.0;
+     }
+	  return (duracion * 0.0343f) / 2.0f;
+	}	
+   196	/*
+   197	  medirEnAngulo:
+   198	  - Mueve servo al ángulo solicitado.
+   199	  - Espera un poco para que el servo se estabilice.
+   200	  - Toma medición de distancia.
+   201	*/
+   202	float medirEnAngulo(int angulo) {
+   203	  sensorServo.write(angulo);
+   204	  delay(250); // tiempo de asentamiento mecánico del servo
+   205	  return medirDistanciaCM();
+   206	}
+   207	
+   208	// -----------------------------------------------------------------------------
+   209	// 6) LÓGICA DE EVASIÓN BÁSICA DE OBSTÁCULOS
+   210	// -----------------------------------------------------------------------------
+   211	
+   212	/*
+   213	  escogerDireccionLibre:
+   214	  Compara distancias izquierda y derecha y retorna:
+   215	  - 'L' si conviene girar a la izquierda
+   216	  - 'R' si conviene girar a la derecha
+   217	*/
+   218	char escogerDireccionLibre() {
+   219	  float dIzq = medirEnAngulo(ANGULO_IZQ);
+   220	  float dDer = medirEnAngulo(ANGULO_DER);
+   221	
+   222	  // Volvemos el servo al centro para no dejarlo desalineado
+   223	  sensorServo.write(ANGULO_CEN);
+   224	
+   225	  BT.printf("Escaneo -> Izq: %.1f cm, Der: %.1f cm\n", dIzq, dDer);
+   226	
+   227	  return (dIzq >= dDer) ? 'L' : 'R';
+   228	}
+   229	
+   230	/*
+   231	  navegarAutomatico:
+   232	  - Si frente libre: avanza.
+   233	  - Si obstáculo cercano: se detiene, retrocede un poco y gira al lado más libre.
+   234	*/
+   235	void navegarAutomatico() {
+   236	  float frente = medirEnAngulo(ANGULO_CEN);
+   237	  BT.printf("Frente: %.1f cm\n", frente);
+   238	
+   239	  if (frente > DISTANCIA_SEGURA_CM) {
+   240	    avanzar(velocidadBase);
+   241	    return;
+   242	  }
+   243	
+   244	  // Obstáculo detectado
+   245	  detenerMotores();
+   246	  delay(200);
+   247	  retroceder(150);
+   248	  delay(300);
+   249	  detenerMotores();
+   250	  delay(150);
+   251	
+   252	  char dir = escogerDireccionLibre();
+   253	  if (dir == 'L') {
+   254	    girarIzquierda(160);
+   255	  } else {
+   256	    girarDerecha(160);
+   257	  }
+   258	
+   259	  delay(350);
+   260	  detenerMotores();
+   261	}
+   262	
+   263	// -----------------------------------------------------------------------------
+   264	// 7) PROCESAMIENTO DE COMANDOS DESDE CELULAR
+   265	// -----------------------------------------------------------------------------
+   266	
+   267	/*
+   268	  Comandos soportados por Bluetooth:
+   269	  - F: Forward (avanzar)
+   270	  - B: Backward (retroceder)
+   271	  - L: Left (girar izquierda)
+   272	  - R: Right (girar derecha)
+   273	  - S: Stop (detener)
+   274	  - A: Alternar modo automático ON/OFF
+   275	  - 0..9: Ajustar velocidad base (0=0, 9=255 aprox.)
+   276	*/
+   277	void procesarComando(char cmd) {
+   278	  // Si llega comando manual de movimiento, desactivamos automático
+   279	  if (cmd == 'F' || cmd == 'B' || cmd == 'L' || cmd == 'R' || cmd == 'S') {
+   280	    modoAutomatico = false;
+   281	  }
+   282	
+   283	  switch (cmd) {
+   284	    case 'F':
+   285	      avanzar(velocidadBase);
+   286	      BT.println("Manual: avanzar");
+   287	      break;
+   288	
+   289	    case 'B':
+   290	      retroceder(velocidadBase);
+   291	      BT.println("Manual: retroceder");
+   292	      break;
+   293	
+   294	    case 'L':
+   295	      girarIzquierda(velocidadBase);
+   296	      BT.println("Manual: izquierda");
+   297	      break;
+   298	
+   299	    case 'R':
+   300	      girarDerecha(velocidadBase);
+   301	      BT.println("Manual: derecha");
+   302	      break;
+   303	
+   304	    case 'S':
+   305	      detenerMotores();
+   306	      BT.println("Manual: stop");
+   307	      break;
+   308	
+   309	    case 'A':
+   310	      modoAutomatico = !modoAutomatico;
+   311	      detenerMotores();
+   312	      BT.printf("Modo automatico: %s\n", modoAutomatico ? "ON" : "OFF");
+   313	      break;
+   314	
+   315	    default:
+   316	      // Control de velocidad con caracteres '0'...'9'
+   317	      if (cmd >= '0' && cmd <= '9') {
+   318	        int nivel = cmd - '0';
+   319	        velocidadBase = map(nivel, 0, 9, 0, 255);
+   320	        BT.printf("Velocidad base: %d\n", velocidadBase);
+   321	      }
+   322	      break;
+   323	  }
+   324	}
+   325	
+   326	// -----------------------------------------------------------------------------
+   327	// 8) SETUP Y LOOP PRINCIPAL
+   328	// -----------------------------------------------------------------------------
+   329	
+   330	void setup() {
+   331	  // Puerto serie para depuración desde PC
+   332	  Serial.begin(115200);
+   333	
+   334	  // Configuración de pines del puente H
+   335	  pinMode(PIN_IN1, OUTPUT);
+   336	  pinMode(PIN_IN2, OUTPUT);
+   337	  pinMode(PIN_IN3, OUTPUT);
+   338	  pinMode(PIN_IN4, OUTPUT);
+   339	
+   340	  // Configuración del ultrasónico
+   341	  pinMode(PIN_TRIG, OUTPUT);
+   342	  pinMode(PIN_ECHO, INPUT);
+   343	
+   344	  // PWM (LEDC) en ESP32 para ENA/ENB
+   345	  ledcSetup(PWM_CH_ENA, PWM_FREQ, PWM_RESOLUTION);
+   346	  ledcSetup(PWM_CH_ENB, PWM_FREQ, PWM_RESOLUTION);
+   347	  ledcAttachPin(PIN_ENA, PWM_CH_ENA);
+   348	  ledcAttachPin(PIN_ENB, PWM_CH_ENB);
+   349	
+   350	  // Inicialización del servo
+   351	  // min/max microsegundos típicos para mayor compatibilidad
+   352	  sensorServo.setPeriodHertz(50);
+   353	  sensorServo.attach(PIN_SERVO, 500, 2400);
+   354	  sensorServo.write(ANGULO_CEN);
+   355	
+   356	  // Inicialización Bluetooth con nombre visible en el celular
+   357	  BT.begin("AREO_ROVER_BT");
+   358	
+   359	  // Estado seguro al arrancar
+   360	  detenerMotores();
+   361	
+   362	  Serial.println("Rover listo. Conecta por Bluetooth a: AREO_ROVER_BT");
+   363	  BT.println("Rover listo. Comandos: F B L R S A y 0..9");
+   364	}
+   365	
+   366	void loop() {
+   367	  // 1) Leer comandos si llegan por Bluetooth
+   368	  while (BT.available() > 0) {
+   369	    char cmd = BT.read();
+   370	
+   371	    // Ignoramos saltos de línea para evitar ruido de apps terminal
+   372	    if (cmd == '\n' || cmd == '\r') {
+   373	      continue;
+   374	    }
+   375	
+   376	    procesarComando(cmd);
+   377	  }
+   378	
+   379	  // 2) Si modo automático está activo, ejecutamos navegación periódicamente
+   380	  if (modoAutomatico) {
+   381	    navegarAutomatico();
+   382	  }
+   383	
+   384	  // Pequeño retardo para no saturar CPU
+   385	  delay(30);
+   386	}
+     1	# AREO-Autonomous-Research-Rover
+     2	
+     3	Prototipo de vehículo autónomo de exploración basado en ESP32 y C++. Este sistema integra inteligencia artificial para la detección de objetos, telemetría en tiempo real y navegación automatizada dependiendo de la misión.
+     4	
+     5	## Firmware educativo inicial
+     6	
+     7	Se agregó un ejemplo de firmware en C++ (estilo Arduino/ESP32) para un rover controlado desde celular por Bluetooth con:
+     8	
+     9	- 4 motores DC (uno por rueda) controlados por puente H.
+    10	- Sensor ultrasónico HC-SR04.
+    11	- Servo para escaneo izquierda/centro/derecha del ultrasónico.
+    12	- Modo manual y modo automático básico de evasión de obstáculos.
+    13	
+    14	Archivo principal:
+    15	
+    16	- `firmware/rover_control_esp32.cpp`
+    17	
+    18	## Comandos Bluetooth
+    19	
+    20	- `F`: avanzar
+    21	- `B`: retroceder
+    22	- `L`: girar a la izquierda
+    23	- `R`: girar a la derecha
+    24	- `S`: detener
+    25	- `A`: activar/desactivar modo automático
+    26	- `0..9`: ajustar velocidad base
+    27	
+    28	## Nota eléctrica importante
+    29	
+    30	El pin `ECHO` del HC-SR04 suele entregar 5V. En ESP32 usa divisor de voltaje o level shifter para proteger GPIO (3.3V).

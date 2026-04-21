@@ -1,0 +1,218 @@
+#include <Arduino.h>
+#include <BluetoothSerial.h>
+#include <ESP32Servo.h>
+
+// --- 1) OBJETOS ---
+BluetoothSerial BT;
+Servo sensorServo;
+
+// --- 2) DECLARACIÓN DE PINES ---
+// Puente H (Motores)
+constexpr int PIN_IN1 = 27;
+constexpr int PIN_IN2 = 26;
+constexpr int PIN_IN3 = 25;
+constexpr int PIN_IN4 = 33;
+constexpr int PIN_ENA = 14;
+constexpr int PIN_ENB = 16;
+
+// Radar (Ultrasónico y Servo) y Alerta (Buzzer)
+constexpr int PIN_TRIG = 4;
+constexpr int PIN_ECHO = 2;
+constexpr int PIN_SERVO = 13;
+constexpr int PIN_BUZZER = 7; 
+
+// --- 3) PARÁMETROS Y VARIABLES DE ESTADO ---
+int velocidadBase = 180;
+bool modoAutomatico = false;
+
+// Ángulos Radar
+constexpr int ANGULO_IZQ = 150;
+constexpr int ANGULO_CEN = 90;
+constexpr int ANGULO_DER = 30;
+
+// Umbrales de distancia (Tus constantes de AREO)
+constexpr float DISTANCIA_PRECOLISION_CM = 40.0;
+constexpr float DISTANCIA_DECISION_ALTA = 30.0;
+constexpr float DISTANCIA_FAILSAFE_CM = 8.0;
+
+// Configuración PWM ESP32
+constexpr int PWM_FREQ = 15000;
+constexpr int PWM_RESOLUTION = 8;
+constexpr int PWM_CH_ENA = 0;
+constexpr int PWM_CH_ENB = 1;
+
+// --- 4) FUNCIONES DE MOVIMIENTO (PUENTE H) ---
+void setVelocidadMotores(int izq, int der) {
+    ledcWrite(PWM_CH_ENA, constrain(izq, 0, 255));
+    ledcWrite(PWM_CH_ENB, constrain(der, 0, 255));
+}
+
+void detenerMotores() {
+    digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+    setVelocidadMotores(0, 0);
+}
+
+void avanzar(int pwm) {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+    setVelocidadMotores(pwm, pwm);
+}
+
+void retroceder(int pwm) {
+    digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
+    digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+    setVelocidadMotores(pwm, pwm);
+}
+
+void girarIzquierda(int pwm) {
+    digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+    setVelocidadMotores(pwm, pwm);
+}
+
+void girarDerecha(int pwm) {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+    setVelocidadMotores(pwm, pwm);
+}
+
+// --- 5) FUNCIONES DEL RADAR ---
+float medirDistanciaCM() {
+    digitalWrite(PIN_TRIG, LOW);
+    delayMicroseconds(3);
+    digitalWrite(PIN_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_TRIG, LOW);
+
+    unsigned long duracion = pulseIn(PIN_ECHO, HIGH, 25000UL);
+    if (duracion == 0) return 999.0;
+    
+    float cm = (duracion * 0.0343f) / 2.0f;
+    
+    // Alerta sonora si hay algo cerca (Detección Radar)
+    if (cm < DISTANCIA_DECISION_ALTA) {
+        tone(PIN_BUZZER, 1000, 30); 
+    }
+    return cm;
+}
+
+float medirEnAngulo(int angulo) {
+    sensorServo.write(angulo);
+    delay(250); // Tiempo para que el servo llegue a la posición
+    return medirDistanciaCM();
+}
+
+char escogerDireccionLibre() {
+    float dIzq = medirEnAngulo(ANGULO_IZQ);
+    float dDer = medirEnAngulo(ANGULO_DER);
+    sensorServo.write(ANGULO_CEN); // Regresar al centro
+    BT.printf("Radar -> Izq: %.1f cm | Der: %.1f cm\n", dIzq, dDer);
+    return (dIzq >= dDer) ? 'L' : 'R';
+}
+
+// --- 6) LÓGICA DE NAVEGACIÓN AUTÓNOMA ---
+void navegarAutomatico() {
+    float frente = medirEnAngulo(ANGULO_CEN);
+    
+    if (frente > DISTANCIA_PRECOLISION_CM) {
+        avanzar(velocidadBase);
+    } 
+    else if (frente <= DISTANCIA_FAILSAFE_CM) {
+        detenerMotores();
+        tone(PIN_BUZZER, 500, 500); // Tono de error/parada
+        BT.println("ALERTA: Failsafe activado!");
+    } 
+    else {
+        // Obstáculo detectado: Maniobra de evasión
+        detenerMotores();
+        delay(200);
+        retroceder(150);
+        delay(400);
+        detenerMotores();
+        
+        char decision = escogerDireccionLibre();
+        if (decision == 'L') {
+            BT.println("Evadiendo por la Izquierda");
+            girarIzquierda(170);
+        } else {
+            BT.println("Evadiendo por la Derecha");
+            girarDerecha(170);
+        }
+        delay(500);
+        detenerMotores();
+    }
+}
+
+// --- 7) PROCESAMIENTO DE COMANDOS BLUETOOTH ---
+void procesarComando(char cmd) {
+    // Si se recibe comando manual, se desactiva el modo autónomo
+    if (cmd == 'F' || cmd == 'B' || cmd == 'L' || cmd == 'R' || cmd == 'S') {
+        modoAutomatico = false;
+    }
+
+    switch (cmd) {
+        case 'F': avanzar(velocidadBase); break;
+        case 'B': retroceder(velocidadBase); break;
+        case 'L': girarIzquierda(velocidadBase); break;
+        case 'R': girarDerecha(velocidadBase); break;
+        case 'S': detenerMotores(); break;
+        case 'A': 
+            modoAutomatico = !modoAutomatico; 
+            detenerMotores();
+            BT.printf("Modo Autónomo: %s\n", modoAutomatico ? "ACTIVADO" : "DESACTIVADO");
+            break;
+    }
+    
+    // Ajuste de velocidad 0-9
+    if (cmd >= '0' && cmd <= '9') {
+        velocidadBase = map(cmd - '0', 0, 9, 0, 255);
+        BT.printf("Nueva Velocidad Base: %d\n", velocidadBase);
+    }
+}
+
+// --- 8) CONFIGURACIÓN INICIAL ---
+void setup() {
+    Serial.begin(115200);
+    
+    // Configuración de Pines
+    pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
+    pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
+    pinMode(PIN_TRIG, OUTPUT); pinMode(PIN_ECHO, INPUT);
+    pinMode(PIN_BUZZER, OUTPUT);
+
+    // Configuración PWM para ESP32
+    ledcSetup(PWM_CH_ENA, PWM_FREQ, PWM_RESOLUTION);
+    ledcSetup(PWM_CH_ENB, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(PIN_ENA, PWM_CH_ENA);
+    ledcAttachPin(PIN_ENB, PWM_CH_ENB);
+
+    // Configuración Servo
+    sensorServo.setPeriodHertz(50);
+    sensorServo.attach(PIN_SERVO, 500, 2400);
+    sensorServo.write(ANGULO_CEN);
+
+    // Bluetooth
+    BT.begin("AREO_ROVER_RADAR");
+    detenerMotores();
+    
+    Serial.println("AREO-Rover: Sistema Unificado Listo");
+}
+
+// --- 9) BUCLE PRINCIPAL ---
+void loop() {
+    // Escuchar comandos Bluetooth
+    if (BT.available()) {
+        char cmd = BT.read();
+        if (cmd != '\n' && cmd != '\r') {
+            procesarComando(cmd);
+        }
+    }
+
+    // Ejecutar navegación si el modo autónomo está ON
+    if (modoAutomatico) {
+        navegarAutomatico();
+    }
+    
+    delay(20); // Estabilidad del procesador
+}
